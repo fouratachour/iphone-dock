@@ -19,12 +19,11 @@
     -webkit-user-select: none; user-select: none;
     transition: background 2s ease;
   }
-  body.day-clear   { background: linear-gradient(160deg, #2b6cb0 0%, #4a90d9 55%, #7fb8f0 100%); }
-  body.day-cloud   { background: linear-gradient(160deg, #4a5568 0%, #6b7a90 60%, #8d9bb0 100%); }
-  body.day-rain    { background: linear-gradient(160deg, #2d3748 0%, #44526a 60%, #5b6b84 100%); }
-  body.night-clear { background: linear-gradient(160deg, #050a1a 0%, #0f1a3a 60%, #1c2b55 100%); }
-  body.night-cloud { background: linear-gradient(160deg, #0b0f17 0%, #1a2130 60%, #2a3344 100%); }
-  body.dim #app { opacity: .45; }
+  #sky { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; display: block; }
+  #shade { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 0; pointer-events: none;
+    background: radial-gradient(ellipse at 30% 40%, rgba(0,0,0,0) 0%, rgba(0,0,0,.18) 100%); }
+  body.dim #shade { background: rgba(0,0,0,.6); transition: background 2s ease; }
+  #app { position: relative; z-index: 1; text-shadow: 0 2px 14px rgba(0,0,0,.28); }
 
   #app {
     height: 100%;
@@ -118,7 +117,9 @@
   }
 </style>
 </head>
-<body class="night-clear">
+<body>
+<canvas id="sky"></canvas>
+<div id="shade"></div>
 <div id="app">
   <section class="clock">
     <div class="time" id="time">--:--</div>
@@ -147,6 +148,253 @@
   </div>
 </div>
 
+<script>
+/* ---------- Fond animé selon la météo ---------- */
+window.Sky = (function () {
+  "use strict";
+  var cv = document.getElementById("sky");
+  var ctx = cv.getContext("2d");
+  var W = 0, H = 0, dpr = 1;
+  var kind = "clear", night = true, phase = "night";
+  var clouds = [], drops = [], flakes = [], stars = [], fogs = [];
+  var flash = 0, nextFlash = 0, last = 0, t = 0;
+
+  // Couleurs du ciel [haut, bas]
+  var PAL = {
+    "clear-day":     ["#1767d4", "#7fbcff"],
+    "clear-dusk":    ["#2b3f8f", "#f3a56f"],
+    "clear-night":   ["#040918", "#18264f"],
+    "partly-day":    ["#2f6fc4", "#9cc2ec"],
+    "partly-dusk":   ["#38427a", "#d99a77"],
+    "partly-night":  ["#070c1c", "#1f2b4a"],
+    "cloudy-day":    ["#55657a", "#9aa8b8"],
+    "cloudy-night":  ["#0d131d", "#263040"],
+    "fog-day":       ["#6a7580", "#9ba4ad"],
+    "fog-night":     ["#161a20", "#30363e"],
+    "drizzle-day":   ["#465568", "#7d8ca0"],
+    "drizzle-night": ["#0b1018", "#202a38"],
+    "rain-day":      ["#333e4f", "#647286"],
+    "rain-night":    ["#080c14", "#1b2330"],
+    "storm-day":     ["#1f2333", "#454b63"],
+    "storm-night":   ["#05060c", "#171a27"],
+    "snow-day":      ["#5a6f8a", "#a4b4c6"],
+    "snow-night":    ["#121a2a", "#33415a"]
+  };
+  var curTop = hex("#040918"), curBot = hex("#18264f"), tgtTop = curTop, tgtBot = curBot;
+
+  function hex(h) { return [parseInt(h.substr(1, 2), 16), parseInt(h.substr(3, 2), 16), parseInt(h.substr(5, 2), 16)]; }
+  function lerp(a, b, k) { return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; }
+  function rgb(c) { return "rgb(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + ")"; }
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+
+  // Nuage pré-dessiné (rapide à afficher)
+  function makeCloud(shade) {
+    var c = document.createElement("canvas");
+    c.width = 420; c.height = 210;
+    var g = c.getContext("2d");
+    var blobs = [[95, 135, 62], [160, 105, 80], [240, 95, 90], [315, 120, 70], [365, 145, 45], [200, 150, 75], [120, 160, 50], [285, 160, 60]];
+    for (var i = 0; i < blobs.length; i++) {
+      var b = blobs[i];
+      var r = g.createRadialGradient(b[0], b[1], 0, b[0], b[1], b[2]);
+      r.addColorStop(0, "rgba(" + shade + ",.95)");
+      r.addColorStop(.55, "rgba(" + shade + ",.6)");
+      r.addColorStop(1, "rgba(" + shade + ",0)");
+      g.fillStyle = r;
+      g.beginPath(); g.arc(b[0], b[1], b[2], 0, 6.2832); g.fill();
+    }
+    return c;
+  }
+  var CLOUD_LIGHT = makeCloud("255,255,255");
+  var CLOUD_GREY = makeCloud("175,185,200");
+  var CLOUD_DARK = makeCloud("85,95,112");
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    build();
+  }
+
+  function build() {
+    var area = (W * H) / (667 * 375);
+    clouds = []; drops = []; flakes = []; stars = []; fogs = [];
+    var nClouds = { clear: 0, partly: 4, cloudy: 8, fog: 2, drizzle: 7, rain: 8, storm: 9, snow: 6 }[kind] || 0;
+    var sprite = (kind === "partly" || kind === "clear") ? CLOUD_LIGHT : (kind === "storm" || kind === "rain") ? CLOUD_DARK : CLOUD_GREY;
+    if (night && sprite === CLOUD_LIGHT) sprite = CLOUD_GREY;
+    for (var i = 0; i < nClouds; i++) {
+      var s = rnd(.6, 1.4) * Math.max(W / 900, .7);
+      clouds.push({ x: rnd(-420 * s, W), y: rnd(-60, H * .45), s: s, v: rnd(4, 12) * (kind === "storm" ? 2 : 1), a: rnd(.35, .8) * (night ? .55 : 1), img: sprite });
+    }
+    if (night && (kind === "clear" || kind === "partly")) {
+      for (i = 0; i < 140 * area; i++) stars.push({ x: rnd(0, W), y: rnd(0, H * .85), r: rnd(.4, 1.5), p: rnd(0, 6.28), f: rnd(.6, 2) });
+    }
+    var nDrops = { drizzle: 70, rain: 170, storm: 260 }[kind] || 0;
+    for (i = 0; i < nDrops * area; i++) drops.push(newDrop(true));
+    if (kind === "snow") for (i = 0; i < 110 * area; i++) flakes.push(newFlake(true));
+    if (kind === "fog") for (i = 0; i < 6; i++) fogs.push({ x: rnd(-W, W), y: rnd(H * .1, H * .95), w: rnd(W * .8, W * 1.6), h: rnd(H * .18, H * .35), v: rnd(6, 16) });
+  }
+
+  function newDrop(anywhere) {
+    var heavy = kind === "storm" ? 1.25 : kind === "drizzle" ? .55 : 1;
+    return { x: rnd(-50, W + 50), y: anywhere ? rnd(-H, H) : rnd(-60, -10), l: rnd(10, 22) * heavy, v: rnd(650, 950) * heavy, a: rnd(.15, .4) };
+  }
+  function newFlake(anywhere) {
+    return { x: rnd(0, W), y: anywhere ? rnd(-H, H) : -10, r: rnd(1, 3.4), v: rnd(25, 70), p: rnd(0, 6.28), sw: rnd(10, 30) };
+  }
+
+  function drawSky() {
+    var g = ctx.createLinearGradient(0, 0, W * .25, H);
+    g.addColorStop(0, rgb(curTop)); g.addColorStop(1, rgb(curBot));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawSun() {
+    var x = W * .5, y = -H * .05;
+    if (phase === "dusk") { x = W * .2; y = H * .95; }
+    var pulse = 1 + Math.sin(t * .6) * .04;
+    var R = Math.max(W, H) * .55 * pulse;
+    var g = ctx.createRadialGradient(x, y, 0, x, y, R);
+    var warm = phase === "dusk" ? "255,190,120" : "255,236,180";
+    var k = kind === "partly" ? .7 : 1;
+    g.addColorStop(0, "rgba(" + warm + "," + .55 * k + ")");
+    g.addColorStop(.25, "rgba(" + warm + "," + .18 * k + ")");
+    g.addColorStop(1, "rgba(" + warm + ",0)");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // rayons doux en rotation lente
+    ctx.save(); ctx.translate(x, y); ctx.rotate(t * .02);
+    ctx.globalAlpha = .06 * k;
+    ctx.fillStyle = "#fff6d8";
+    for (var i = 0; i < 12; i++) {
+      ctx.rotate(Math.PI / 6);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(R * 1.2, -R * .06); ctx.lineTo(R * 1.2, R * .06); ctx.closePath(); ctx.fill();
+    }
+    ctx.restore(); ctx.globalAlpha = 1;
+  }
+
+  function drawMoon() {
+    var x = W * .5, y = H * .08, r = Math.min(W, H) * .07;
+    var g = ctx.createRadialGradient(x, y, r * .5, x, y, r * 7);
+    g.addColorStop(0, "rgba(200,215,255,.22)"); g.addColorStop(1, "rgba(200,215,255,0)");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    var S = Math.ceil(r * 2 + 4);
+    if (!drawMoon.img || drawMoon.S !== S) {
+      var m = document.createElement("canvas"); m.width = m.height = S * 2;
+      var mg = m.getContext("2d"); mg.scale(2, 2);
+      mg.fillStyle = "rgba(240,244,255,.92)";
+      mg.beginPath(); mg.arc(S / 2, S / 2, r, 0, 6.2832); mg.fill();
+      mg.globalCompositeOperation = "destination-out";
+      mg.beginPath(); mg.arc(S / 2 + r * .45, S / 2 - r * .2, r * .92, 0, 6.2832); mg.fill();
+      drawMoon.img = m; drawMoon.S = S;
+    }
+    ctx.drawImage(drawMoon.img, x - S / 2, y - S / 2, S, S);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (now - last < 33) return; // ~30 images/s : économise la batterie
+    var dt = Math.min((now - last) / 1000, .1);
+    last = now; t += dt;
+
+    curTop = lerp(curTop, tgtTop, .03); curBot = lerp(curBot, tgtBot, .03);
+    drawSky();
+
+    var i, o;
+    for (i = 0; i < stars.length; i++) {
+      o = stars[i];
+      ctx.globalAlpha = .35 + .65 * Math.abs(Math.sin(t * o.f + o.p));
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(o.x, o.y, o.r, o.r);
+    }
+    ctx.globalAlpha = 1;
+
+    if (kind === "clear" || kind === "partly") { if (night) drawMoon(); else drawSun(); }
+
+    for (i = 0; i < clouds.length; i++) {
+      o = clouds[i];
+      o.x += o.v * dt;
+      if (o.x > W + 20) { o.x = -420 * o.s - rnd(0, 200); o.y = rnd(-60, H * .45); }
+      ctx.globalAlpha = o.a;
+      ctx.drawImage(o.img, o.x, o.y, 420 * o.s, 210 * o.s);
+    }
+    ctx.globalAlpha = 1;
+
+    for (i = 0; i < fogs.length; i++) {
+      o = fogs[i];
+      o.x += o.v * dt;
+      if (o.x > W) o.x = -o.w;
+      var fg = ctx.createRadialGradient(o.x + o.w / 2, o.y, 0, o.x + o.w / 2, o.y, o.w / 2);
+      fg.addColorStop(0, "rgba(230,235,240,.28)"); fg.addColorStop(1, "rgba(230,235,240,0)");
+      ctx.fillStyle = fg;
+      ctx.save(); ctx.translate(0, o.y); ctx.scale(1, o.h / o.w); ctx.translate(0, -o.y);
+      ctx.fillRect(o.x, o.y - o.w / 2, o.w, o.w); ctx.restore();
+    }
+
+    if (drops.length) {
+      ctx.strokeStyle = night ? "rgba(170,190,220,.35)" : "rgba(220,232,250,.45)";
+      ctx.lineWidth = kind === "drizzle" ? 1 : 1.3;
+      ctx.beginPath();
+      for (i = 0; i < drops.length; i++) {
+        o = drops[i];
+        o.y += o.v * dt; o.x -= o.v * .18 * dt;
+        if (o.y > H + 20) drops[i] = o = newDrop(false);
+        ctx.moveTo(o.x, o.y); ctx.lineTo(o.x + o.l * .18, o.y - o.l);
+      }
+      ctx.stroke();
+    }
+
+    if (flakes.length) {
+      ctx.fillStyle = "rgba(255,255,255,.85)";
+      ctx.beginPath();
+      for (i = 0; i < flakes.length; i++) {
+        o = flakes[i];
+        o.y += o.v * dt; o.p += dt;
+        var fx = o.x + Math.sin(o.p) * o.sw;
+        if (o.y > H + 10) flakes[i] = o = newFlake(false);
+        ctx.moveTo(fx + o.r, o.y); ctx.arc(fx, o.y, o.r, 0, 6.2832);
+      }
+      ctx.fill();
+    }
+
+    if (kind === "storm") {
+      if (t > nextFlash) { flash = 1; nextFlash = t + rnd(4, 11); if (Math.random() < .5) setTimeout(function () { flash = .8; }, 160); }
+      if (flash > .01) {
+        ctx.fillStyle = "rgba(220,230,255," + flash * .45 + ")";
+        ctx.fillRect(0, 0, W, H);
+        flash *= .82;
+      }
+    }
+  }
+
+  function set(k, isNight, isDusk) {
+    var changed = k !== kind || isNight !== night;
+    kind = k; night = isNight;
+    phase = isNight ? "night" : (isDusk && (k === "clear" || k === "partly") ? "dusk" : "day");
+    var key = k + "-" + phase;
+    if (!PAL[key]) key = k + "-" + (isNight ? "night" : "day");
+    var p = PAL[key] || PAL["clear-day"];
+    tgtTop = hex(p[0]); tgtBot = hex(p[1]);
+    if ((set.n = (set.n || 0) + 1) <= 2) { curTop = tgtTop; curBot = tgtBot; }
+    if (changed) build();
+  }
+
+  function kindFromCode(c) {
+    if (c <= 1) return "clear";
+    if (c === 2) return "partly";
+    if (c === 3) return "cloudy";
+    if (c === 45 || c === 48) return "fog";
+    if (c >= 51 && c <= 57) return "drizzle";
+    if ((c >= 71 && c <= 77) || c === 85 || c === 86) return "snow";
+    if (c >= 95) return "storm";
+    return "rain";
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+  requestAnimationFrame(frame);
+  return { set: set, kindFromCode: kindFromCode };
+})();
+</script>
 <script>
 (function () {
   "use strict";
@@ -416,12 +664,34 @@
       });
   }
 
+  // Aperçu possible : ?meteo=clear|partly|cloudy|fog|drizzle|rain|storm|snow &nuit=1 &crepuscule=1
+  var params = {};
+  location.search.replace(/[?&]([^=&]+)=([^&]*)/g, function (_, k, v) { params[k] = decodeURIComponent(v); });
+  var ALIAS = { soleil: "clear", nuageux: "cloudy", pluie: "rain", orage: "storm", neige: "snow", brouillard: "fog", bruine: "drizzle", eclaircies: "partly" };
+
+  function minutesOf(iso) { return +iso.slice(11, 13) * 60 + +iso.slice(14, 16); }
+
+  function updateSky() {
+    var d = lastData;
+    var kind = "clear", isNight = true, isDusk = false;
+    if (d && d.current) {
+      kind = Sky.kindFromCode(d.current.weather_code);
+      isNight = d.current.is_day === 0;
+      var now = minutesOf(d.current.time);
+      var rise = minutesOf(d.daily.sunrise[0]), set = minutesOf(d.daily.sunset[0]);
+      isDusk = Math.abs(now - rise) < 50 || Math.abs(now - set) < 50;
+    }
+    if (params.meteo) { kind = ALIAS[params.meteo] || params.meteo; isNight = params.nuit === "1"; isDusk = params.crepuscule === "1"; }
+    Sky.set(kind, isNight, isDusk);
+  }
+  updateSky();
+
   function render() {
     var d = lastData;
     if (!d || !d.current) return;
     var c = d.current;
     var w = wmo(c.weather_code, c.is_day);
-    document.body.className = document.body.className.replace(/\b(day|night)-\w+\b/g, "").trim() + " " + themeFor(c.weather_code, c.is_day);
+    updateSky();
 
     var sunrise = d.daily.sunrise[0].slice(11, 16);
     var sunset = d.daily.sunset[0].slice(11, 16);
