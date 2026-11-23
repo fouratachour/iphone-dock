@@ -1,0 +1,29 @@
+name: Horaires mosquée
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # chaque lundi à 3h (UTC)
+  workflow_dispatch:
+  push:
+    paths:
+      - mosque.txt
+      - fetch_mosque.py
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python fetch_mosque.py
+      - name: Enregistrer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mosque.json
+          git diff --cached --quiet || (git commit -m "Mise à jour des horaires de la mosquée" && git push)

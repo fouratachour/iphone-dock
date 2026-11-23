@@ -41,6 +41,11 @@
   .time { font-size: 26vh; font-weight: 200; letter-spacing: -0.03em; line-height: .95; font-variant-numeric: tabular-nums; }
   .time .sec { font-size: .28em; opacity: .55; margin-left: .15em; font-weight: 300; vertical-align: top; position: relative; top: .5em; }
   .date { font-size: 6vh; font-weight: 400; opacity: .85; margin-top: 2vh; text-transform: capitalize; }
+  .prayer { font-size: 5vh; margin-top: 1.5vh; display: none; align-items: baseline; gap: .5em; flex-wrap: wrap; }
+  .prayer.on { display: flex; }
+  .prayer b { font-weight: 600; }
+  .prayer .left { color: #ffe08a; font-variant-numeric: tabular-nums; }
+  .prayer .mq { flex-basis: 100%; font-size: .6em; opacity: .65; text-transform: capitalize; }
   .city {
     font-size: 4.4vh; margin-top: 2vh; align-self: flex-start;
     display: inline-flex; align-items: center; gap: .4em;
@@ -118,6 +123,7 @@
   <section class="clock">
     <div class="time" id="time">--:--</div>
     <div class="date" id="date"></div>
+    <div class="prayer" id="prayer"></div>
     <div class="city" id="city">📍 Choisir une ville</div>
   </section>
 
@@ -196,6 +202,77 @@
     return "day-clear";
   }
 
+  // ---------- Prières ----------
+  var PRAYERS = [["Fajr", "Fajr"], ["Dhuhr", "Dhuhr"], ["Asr", "Asr"], ["Maghrib", "Maghrib"], ["Isha", "Isha"]];
+  var prayerTimes = []; // [{name, date}]
+  var prayerKey = "";
+
+  function ddmmyyyy(d) { return pad(d.getDate()) + "-" + pad(d.getMonth() + 1) + "-" + d.getFullYear(); }
+
+  var mosque = null; // horaires de la mosquée (mosque.json), si configurée
+
+  function mosqueDay(d) {
+    var cal = mosque.calendar && mosque.calendar[d.getMonth()];
+    var row = cal && cal[String(d.getDate())];
+    if (!row) return null;
+    var idx = [0, 2, 3, 4, 5]; // fajr, dhuhr, asr, maghrib, isha (on saute shuruq)
+    return PRAYERS.map(function (p, i) {
+      var t = row[idx[i]];
+      var name = p[1];
+      if (i === 1 && d.getDay() === 5 && mosque.jumua) { t = mosque.jumua; name = "Jumu'a"; }
+      var hm = t.split(":");
+      return { name: name, date: new Date(d.getFullYear(), d.getMonth(), d.getDate(), +hm[0], +hm[1], 0) };
+    });
+  }
+
+  function loadPrayers(lat, lon, tz) {
+    var today = new Date();
+    if (mosque) {
+      var a = mosqueDay(today), b = mosqueDay(new Date(today.getTime() + 86400000));
+      if (a && b) { prayerTimes = a.concat(b); updatePrayer(today); return; }
+    }
+    var key = lat.toFixed(2) + "," + lon.toFixed(2) + "," + today.toDateString();
+    if (key === prayerKey && prayerTimes.length) return;
+    // France : méthode UOIF (12), sinon Ligue islamique mondiale (3)
+    var method = /^Europe\/Paris$/.test(tz || "") ? 12 : 3;
+    var tomorrow = new Date(today.getTime() + 86400000);
+    var get = function (d) {
+      return fetch("https://api.aladhan.com/v1/timings/" + ddmmyyyy(d) + "?latitude=" + lat + "&longitude=" + lon + "&method=" + method)
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          return PRAYERS.map(function (p) {
+            var hm = j.data.timings[p[0]].slice(0, 5).split(":");
+            var t = new Date(d.getFullYear(), d.getMonth(), d.getDate(), +hm[0], +hm[1], 0);
+            return { name: p[1], date: t };
+          });
+        });
+    };
+    Promise.all([get(today), get(tomorrow)]).then(function (res) {
+      prayerTimes = res[0].concat(res[1]);
+      prayerKey = key;
+      updatePrayer(new Date());
+    }).catch(function () {});
+  }
+
+  function updatePrayer(now) {
+    var el = document.getElementById("prayer");
+    if (!el || !prayerTimes.length) return;
+    var next = null;
+    for (var i = 0; i < prayerTimes.length; i++) {
+      if (prayerTimes[i].date > now) { next = prayerTimes[i]; break; }
+    }
+    if (!next) { el.classList.remove("on"); return; }
+    var mins = Math.ceil((next.date - now) / 60000);
+    var h = Math.floor(mins / 60), m = mins % 60;
+    var left = h > 0 ? h + " h " + pad(m) + " min" : m + " min";
+    var hhmm = pad(next.date.getHours()) + ":" + pad(next.date.getMinutes());
+    el.innerHTML = '🕌 <b>' + next.name + '</b> ' + hhmm + ' <span class="left">dans ' + left + '</span>' +
+      (mosque ? '<span class="mq">' + mosque.name + '</span>' : '');
+    el.classList.add("on");
+    // Recharger les horaires quand on change de jour
+    if (now.getHours() === 0 && now.getMinutes() === 5 && lastData) loadPrayers(lastData.latitude, lastData.longitude, lastData.timezone);
+  }
+
   // ---------- Horloge ----------
   var timeEl = document.getElementById("time");
   var dateEl = document.getElementById("date");
@@ -209,6 +286,8 @@
     if (showSeconds) html += '<span class="sec">' + pad(now.getSeconds()) + "</span>";
     timeEl.innerHTML = html;
     dateEl.textContent = dateFmt.format(now);
+
+    updatePrayer(now);
 
     // Mode nuit : écran atténué entre 22h et 7h
     var h = now.getHours();
@@ -330,7 +409,7 @@
 
     fetch(url)
       .then(function (r) { return r.json(); })
-      .then(function (d) { lastData = d; render(); })
+      .then(function (d) { lastData = d; render(); loadPrayers(d.latitude, d.longitude, d.timezone); })
       .catch(function () {
         if (!lastData) nowEl.innerHTML = '<div class="msg">Pas de connexion… nouvel essai bientôt</div>';
         setTimeout(loadWeather, 60 * 1000);
@@ -350,8 +429,9 @@
     nowEl.innerHTML =
       '<div class="now-top"><div class="now-icon">' + w[0] + '</div>' +
       '<div class="now-temp">' + Math.round(c.temperature_2m) + '<sup>°</sup></div></div>' +
-      '<div class="now-desc">' + w[1] + ' · ' + Math.round(d.daily.temperature_2m_max[0]) + '° / ' + Math.round(d.daily.temperature_2m_min[0]) + '°</div>' +
+      '<div class="now-desc">' + w[1] + '</div>' +
       '<div class="now-details">' +
+        '<span>↑' + Math.round(d.daily.temperature_2m_max[0]) + '° ↓' + Math.round(d.daily.temperature_2m_min[0]) + '°</span>' +
         '<span>Ressenti ' + Math.round(c.apparent_temperature) + '°</span>' +
         '<span>💧 ' + c.relative_humidity_2m + '%</span>' +
         '<span>💨 ' + Math.round(c.wind_speed_10m) + ' km/h</span>' +
@@ -403,6 +483,12 @@
   });
   // Toucher la météo actuelle : rafraîchir
   nowEl.addEventListener("click", loadWeather);
+
+  // Horaires de la mosquée (fichier mis à jour chaque semaine par GitHub)
+  fetch("mosque.json", { cache: "no-cache" })
+    .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+    .then(function (m) { if (m && m.calendar) { mosque = m; prayerKey = ""; if (lastData) loadPrayers(lastData.latitude, lastData.longitude, lastData.timezone); } })
+    .catch(function () {});
 
   loadWeather();
   setInterval(loadWeather, REFRESH_MS);
